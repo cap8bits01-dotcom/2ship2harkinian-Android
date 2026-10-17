@@ -1,0 +1,94 @@
+name: Android APK (audio + FPS)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK parts
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-33" "build-tools;34.0.0" "ndk;26.0.10792818" "cmake;3.28.3"
+
+      - name: Apply audio and FPS changes
+        run: |
+          python3 - <<'PY'
+          import re
+
+          def edit(path, old, new):
+              s = open(path).read()
+              assert old in s, "pattern not found in " + path
+              open(path, "w").write(s.replace(old, new, 1))
+
+          edit("libultraship/src/audio/AudioPlayer.h",
+               "    int SampleLength = 1024;\n    int DesiredBuffered = 2480;",
+               "#ifdef __ANDROID__\n    int SampleLength = 2048;\n    int DesiredBuffered = 4410;\n#else\n    int SampleLength = 1024;\n    int DesiredBuffered = 2480;\n#endif")
+
+          edit("libultraship/src/audio/SDLAudioPlayer.cpp",
+               "#include <spdlog/spdlog.h>",
+               "#include <algorithm>\n#include <spdlog/spdlog.h>")
+
+          edit("libultraship/src/audio/SDLAudioPlayer.cpp",
+               "    if (Buffered() < 6000) {\n        // Don't fill the audio buffer too much in case this happens\n        SDL_QueueAudio(mDevice, buf, len);\n    }",
+               "    const int maxBuffered = std::max(6000, GetDesiredBuffered() * 2 + 2048);\n    if (Buffered() < maxBuffered) {\n        SDL_QueueAudio(mDevice, buf, len);\n    }")
+
+          edit("libultraship/src/graphic/Fast3D/gfx_sdl2.cpp",
+               "static inline void sync_framerate_with_timer(void) {\n",
+               "static inline void sync_framerate_with_timer(void) {\n"
+               "#ifdef __ANDROID__\n"
+               "    if (vsync_enabled) {\n"
+               "        uint32_t refresh_rate = 0;\n"
+               "        gfx_sdl_get_active_window_refresh_rate(&refresh_rate);\n"
+               "        if (refresh_rate > 0 && target_fps >= (int)refresh_rate - 1) {\n"
+               "            previous_time = qpc_to_100ns(SDL_GetPerformanceCounter());\n"
+               "            return;\n"
+               "        }\n"
+               "    }\n"
+               "#endif\n")
+
+          edit("libultraship/src/graphic/Fast3D/gfx_sdl2.cpp",
+               "#ifdef _WIN32\n    // We want to exit a bit early, so we can busy-wait the rest to never miss the deadline\n    left -= 15000UL;\n#endif",
+               "#if defined(_WIN32) || defined(__ANDROID__)\n    // We want to exit a bit early, so we can busy-wait the rest to never miss the deadline\n    left -= 15000UL;\n#endif")
+
+          edit("libultraship/src/graphic/Fast3D/gfx_sdl2.cpp",
+               "        t = qpc_to_100ns(SDL_GetPerformanceCounter());\n    }\n#endif\n    t = qpc_to_100ns(SDL_GetPerformanceCounter());\n    if (left > 0 && t - next < 10000) {",
+               "        t = qpc_to_100ns(SDL_GetPerformanceCounter());\n    }\n#endif\n#ifdef __ANDROID__\n    t = qpc_to_100ns(SDL_GetPerformanceCounter());\n    while (t < next) {\n        t = qpc_to_100ns(SDL_GetPerformanceCounter());\n    }\n#endif\n    t = qpc_to_100ns(SDL_GetPerformanceCounter());\n    if (left > 0 && t - next < 10000) {")
+
+          # Build only arm64 (nearly every modern phone) to keep the build short.
+          p = "Android/app/build.gradle"
+          s = open(p).read()
+          s, n = re.subn(r"^(\s+)abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'",
+                         r"\1abiFilters 'arm64-v8a'", s, count=1, flags=re.M)
+          assert n == 1, "abiFilters line not found"
+          open(p, "w").write(s)
+          PY
+
+      - name: Build release APK
+        working-directory: Android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Sign APK with a throwaway key
+        run: |
+          keytool -genkeypair -keystore ci.jks -alias ci -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android -dname "CN=CI"
+          APK=$(find Android/app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" sign --ks ci.jks --ks-pass pass:android \
+            --out 2s2h-android-signed.apk "$APK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 2s2h-android-apk
+          path: 2s2h-android-signed.apk
